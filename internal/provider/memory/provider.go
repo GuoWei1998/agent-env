@@ -6,22 +6,26 @@ import (
 	"sync"
 )
 
+// Provider keeps simulated records in process memory. It starts no workload;
+// it exists so the API contract can be tested without a cluster.
 type Provider struct {
 	mu      sync.RWMutex
 	records map[string]sandbox.Sandbox
 }
 
 func New() *Provider { return &Provider{records: make(map[string]sandbox.Sandbox)} }
+
 func (p *Provider) Create(ctx context.Context, record sandbox.Sandbox) (sandbox.Sandbox, error) {
 	if err := ctx.Err(); err != nil {
 		return sandbox.Sandbox{}, err
 	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	record.Status = "simulated"
+	record.Status = sandbox.StatusSimulated
 	p.records[record.ID] = record
 	return record, nil
 }
+
 func (p *Provider) Get(ctx context.Context, id string) (sandbox.Sandbox, error) {
 	if err := ctx.Err(); err != nil {
 		return sandbox.Sandbox{}, err
@@ -34,6 +38,7 @@ func (p *Provider) Get(ctx context.Context, id string) (sandbox.Sandbox, error) 
 	}
 	return record, nil
 }
+
 func (p *Provider) Close(ctx context.Context, id string) error {
 	if err := ctx.Err(); err != nil {
 		return err

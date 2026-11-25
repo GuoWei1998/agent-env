@@ -1,19 +1,68 @@
-# 技术选型与取舍
+# 技术选型
 
-v1 更新：单集群 provider 先通过 kubectl 调用 Kubernetes API，以最少依赖验证冷创建。下表的 client-go 是后续多集群与共享 watch 的目标选型；具体版本与验收见[迭代计划](iteration-plan.md)。
+原则：**每引入一个依赖，都要有一个只有它才能验证的验收用例。** 例如 PostgreSQL 对应"进程崩溃后恢复"，Kubernetes 对应"真实资源被清理干净"。在那之前保持零外部服务，改完代码几秒内就能跑完测试。
 
-| 层次 | 选择与状态 | 原因与替换条件 |
+架构见[总体设计](design.md)，各版本范围见[迭代计划](iteration-plan.md)。
+
+## 1. 当前选型
+
+| 层次 | 现在用 | 以后换成 | 什么时候换 |
+| --- | --- | --- | --- |
+| 语言与 HTTP | Go 标准库 `net/http` + JSON | 暂不更换 | 执行协议稳定后再考虑 gRPC 等代码生成方案 |
+| 状态存储 | 不存储：memory 用进程内 map，kube 直接查集群 | PostgreSQL | v3，需要配额、幂等键和租约的跨进程事务时 |
+| 编排 | Kubernetes Pod，通过 `kubectl` 调用 | client-go + 共享 watch | v4，多集群且轮询请求量成为问题时 |
+| 执行与文件 | 无（验收时借用 `kubectl exec`） | 沙箱内 Go agent + HTTP 流 | v2 |
+| 测试 | `testing` + `httptest`，kubectl 用假实现替换 | 增加真实集群回归 | 涉及网络策略、进程回收等只能在 Linux 集群验证的能力时 |
+
+两点说明：
+
+- **为什么先用 kubectl 而不是 client-go。** 单集群阶段 kubectl 零依赖，出问题可以把同一条命令拿到终端里复现。代价是每次调用启动一个子进程，且只能轮询。换成 client-go 时两者不能同时写同一资源。
+- **为什么不自己做调度。** 节点选择、镜像拉取、健康检查都交给 Kubernetes，项目只关注沙箱本身的生命周期。
+
+## 2. 隔离技术怎么选
+
+隔离强度和启动速度、兼容性之间需要取舍，目前主流是四类：
+
+| 技术 | 原理 | 隔离强度 | 启动 | 兼容性 | 代表用户 |
+| --- | --- | --- | --- | --- | --- |
+| 普通容器（runc） | namespace + cgroup + seccomp，共享宿主内核 | 弱：内核漏洞可逃逸 | 快 | 最好 | Daytona、本项目 v1 |
+| [gVisor](https://gvisor.dev/docs/) | 用户态内核拦截系统调用，极少直接接触宿主内核 | 较强 | 快 | 部分系统调用不支持，文件 I/O 较慢 | Modal |
+| microVM（[Firecracker](https://github.com/firecracker-microvm/firecracker)、[Kata Containers](https://github.com/kata-containers/kata-containers)） | 每个沙箱有独立内核，靠硬件虚拟化隔离 | 强 | 冷启动较慢，配合快照可以很快 | 好（完整 Linux） | E2B、Vercel Sandbox |
+| 进程级沙箱（bubblewrap、Seatbelt） | 直接限制本机进程能访问的文件和网络 | 取决于规则 | 几乎无开销 | 就是本机环境 | [Claude Code sandbox-runtime](https://github.com/anthropic-experimental/sandbox-runtime) |
+
+本项目的路线：
+
+1. **v1 用加固的普通容器。** 任何 Kubernetes 集群都能跑，足够验证生命周期。只运行自己信任的代码。
+2. **v6 优先尝试 gVisor 或 Kata。** 两者在 Kubernetes 里都只是一个 `RuntimeClass`，Pod 清单加一个字段即可，kube provider 几乎不用改。先在已配置好运行时的节点上测系统调用兼容性、构建耗时和文件 I/O。
+3. **Firecracker 需要独立的 provider。** 它要求支持 KVM 的 Linux 宿主，并且要自己管理镜像、网络和快照。有合适的机器后再做，在此之前不承诺 VM 级隔离和暂停恢复。
+4. **进程级沙箱不在范围内。** 它解决的是"在开发者本机限制 Agent"，和本项目"远端托管环境"的方向不同。但它的网络模型值得借鉴：所有出网流量经过代理，按域名白名单放行。
+
+## 3. 主流沙箱产品参照
+
+| 产品 | 隔离方式 | 值得参考的设计 |
 | --- | --- | --- |
-| 语言与 HTTP | 已用 Go、标准库 net/http、JSON | 同一种语言编写管理服务和节点 agent；1.22 路由足够支撑首版。协议稳定前不引入 RPC 代码生成。 |
-| 状态 | 已用内存 map + RWMutex；计划 PostgreSQL | 内存适合单进程契约测试，不提供持久性。引入配额、幂等、租约时需要跨进程事务；届时分离状态仓库和真实 provider，避免让 Pod 创建承担数据库写入职责。 |
-| 编排 | 计划 kind + client-go | 先验证单集群，复用 Kubernetes 的 Pod 生命周期和调度；通过共享 watch 观察就绪，并处理断线重列。首版不自建节点调度器。 |
-| 执行与文件 | 计划 Go agent + HTTP 字节流 | 在 workload 内执行 argv；文本日志和二进制文件分开。先验证限时、取消、目录边界和输出上限，再增加交互式终端。 |
-| 测试与指标 | 已用 testing、httptest；计划真实集群回归 | HTTP 契约测试不依赖 Docker；Pod 生命周期、网络策略和进程回收必须在 Linux 集群验证。分开测 SDK 等待、provider 耗时与执行耗时。 |
+| [E2B](https://github.com/e2b-dev/infra) | Firecracker microVM | 沙箱内守护进程 envd 提供执行与文件接口；模板由 Dockerfile 构建后做成快照；超时自动销毁、可续期；支持暂停与恢复 |
+| [Modal Sandbox](https://modal.com/docs/guide/sandbox) | gVisor | 以 SDK 为中心的 `create` / `exec` 接口；文件系统快照；空闲超时；可限制出网 |
+| [Daytona](https://github.com/daytonaio/daytona) | OCI 容器 | 面向 Agent 的进程、文件、Git 接口；停止、归档等多级休眠状态；自动停止间隔 |
+| [Kubernetes Agent Sandbox](https://github.com/kubernetes-sigs/agent-sandbox) | Pod，可叠加 gVisor / Kata | 用 CRD 建模：`Sandbox`、`SandboxTemplate`、`SandboxClaim`、`SandboxWarmPool`，把模板、领取和预热池分开 |
+| [Cloudflare Sandbox](https://developers.cloudflare.com/sandbox/) | 容器 | 每个沙箱绑定一个有状态对象作为入口，天然解决"请求路由到哪个实例" |
+| [Vercel Sandbox](https://vercel.com/docs/vercel-sandbox) | Firecracker microVM | 短生命周期、按运行时长计费的一次性环境 |
 
-## 沙箱技术参照
+共同点可以归纳为五条，本项目都会遵循：
 
-- [Kubernetes Agent Sandbox](https://github.com/kubernetes-sigs/agent-sandbox)：参考模板、领取和预热池的资源建模。个人项目先写最小池，理解控制器如何处理并发领取，再评估采用 CRD。
-- [gVisor](https://gvisor.dev/docs/)：作为容器后端的隔离候选。在已配置对应运行时的节点验证系统调用兼容性、构建耗时和文件 I/O，再决定哪些模板启用。
-- [Firecracker](https://github.com/firecracker-microvm/firecracker) 与 [E2B runtime](https://github.com/e2b-dev/runtime)：分别参考 KVM microVM 和利用快照交付 Agent 环境的工程方式。有合适 Linux 宿主后再开发 provider，不给当前内存或未来普通 Pod 后端承诺 VM 隔离、暂停恢复语义。
+1. **控制面和数据面分开。** 管理接口只负责生命周期，命令和文件直接走到沙箱。
+2. **沙箱里放一个常驻 agent。** 上层协议不依赖底层是容器还是虚拟机。
+3. **默认会过期。** 每个沙箱都有超时，靠续期保活，而不是靠用户记得删除。
+4. **模板先构建好。** 启动快慢主要取决于镜像是否已在节点上，以及有没有现成的空闲实例或快照。
+5. **出网可以收紧。** 都提供禁止出网或按白名单放行的手段；本项目更进一步，计划默认禁止。
 
-目前选择零外部服务启动，以缩短学习反馈周期。引入每个依赖时都应附一个只有它才能验证的验收用例，例如 PostgreSQL 对应进程崩溃恢复，Kubernetes 对应真实资源清理。
+与 Kubernetes Agent Sandbox 的关系：它和本项目目标最接近。本项目先自己写最小实现，弄清并发领取、预热池补充这些问题，到 v5 再评估是否直接采用它的 CRD。
+
+## 4. 还没定的问题
+
+| 问题 | 倾向 | 在哪个版本决定 |
+| --- | --- | --- |
+| 执行输出用什么传输 | HTTP 流式响应，文本日志与二进制文件分开；交互式终端以后再加 | v2 |
+| 沙箱内 agent 怎么放进镜像 | 先打进模板镜像；模板变多后改为 init 容器注入 | v2 |
+| 出网限制用什么实现 | 先用 NetworkPolicy 默认拒绝；需要按域名放行时再加出口代理 | v3 |
+| 预热池自己写还是用 CRD | 先写固定水位的最小池，再与 Agent Sandbox 对比 | v5 |

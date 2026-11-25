@@ -39,3 +39,17 @@ func TestWaitReady(t *testing.T) {
 		})
 	}
 }
+
+func TestNotFound(t *testing.T) {
+	c := Client{"http://manager/", &http.Client{Transport: transport(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/v1/sandboxes/id" {
+			t.Fatal(r.URL.Path)
+		}
+		return &http.Response{StatusCode: 404, Body: io.NopCloser(strings.NewReader(`{"error":"not_found"}`))}, nil
+	})}}
+	_, err := c.Get(context.Background(), "id")
+	var apiErr *APIError
+	if !errors.Is(err, ErrNotFound) || !errors.As(err, &apiErr) || apiErr.Code != "not_found" {
+		t.Fatal(err)
+	}
+}

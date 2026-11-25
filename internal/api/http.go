@@ -9,6 +9,8 @@ import (
 	"net/http"
 )
 
+// New returns the manager HTTP API. Handlers only translate between HTTP and
+// sandbox.Service; they never reach into a provider directly.
 func New(service sandbox.Service) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -33,7 +35,7 @@ func New(service sandbox.Service) http.Handler {
 		reply(w, 201, record)
 	})
 	mux.HandleFunc("GET /v1/sandboxes/{id}", func(w http.ResponseWriter, r *http.Request) {
-		record, err := service.Provider.Get(r.Context(), r.PathValue("id"))
+		record, err := service.Get(r.Context(), r.PathValue("id"))
 		if err != nil {
 			failure(w, err)
 			return
@@ -41,7 +43,7 @@ func New(service sandbox.Service) http.Handler {
 		reply(w, 200, record)
 	})
 	mux.HandleFunc("DELETE /v1/sandboxes/{id}", func(w http.ResponseWriter, r *http.Request) {
-		if err := service.Provider.Close(r.Context(), r.PathValue("id")); err != nil {
+		if err := service.Close(r.Context(), r.PathValue("id")); err != nil {
 			failure(w, err)
 			return
 		}
@@ -49,6 +51,7 @@ func New(service sandbox.Service) http.Handler {
 	})
 	return mux
 }
+
 func failure(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, sandbox.ErrNotFound):
@@ -60,9 +63,11 @@ func failure(w http.ResponseWriter, err error) {
 		fail(w, 500, "internal_error")
 	}
 }
+
 func fail(w http.ResponseWriter, code int, msg string) {
 	reply(w, code, map[string]string{"error": msg})
 }
+
 func reply(w http.ResponseWriter, code int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)

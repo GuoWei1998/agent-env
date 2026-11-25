@@ -1,3 +1,5 @@
+// Package kube runs each sandbox as one hardened Pod in a dedicated
+// namespace, talking to the cluster through kubectl.
 package kube
 
 import (
@@ -12,37 +14,59 @@ import (
 	"time"
 )
 
-const owner = "agent-env.local/managed=v1"
+const (
+	podPrefix     = "ae-"
+	managedLabel  = "agent-env.local/managed"
+	managedValue  = "v1"
+	templateLabel = "agent-env.local/template"
+	// owner selects only Pods created by this provider.
+	owner = managedLabel + "=" + managedValue
+	// lifetimeSeconds caps how long a sandbox may run.
+	lifetimeSeconds = 3600
+)
 
-var validID = regexp.MustCompile("^[a-f0-9]{32}$")
+var (
+	validID        = regexp.MustCompile("^[a-f0-9]{32}$")
+	validNamespace = regexp.MustCompile("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+)
 
-type runner func(context.Context, []byte, ...string) ([]byte, error)
+// runner executes kubectl with the given stdin and arguments. Tests replace it.
+type runner func(ctx context.Context, stdin []byte, args ...string) ([]byte, error)
+
 type Provider struct {
 	namespace, image string
 	run              runner
 }
 
 func New(namespace, image string) (*Provider, error) {
-	if len(namespace) > 63 || !regexp.MustCompile("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$").MatchString(namespace) || strings.TrimSpace(image) == "" {
-		return nil, fmt.Errorf("invalid namespace or image")
+	if len(namespace) > 63 || !validNamespace.MatchString(namespace) {
+		return nil, fmt.Errorf("invalid namespace %q", namespace)
 	}
-	return &Provider{namespace, image, func(ctx context.Context, input []byte, args ...string) ([]byte, error) {
-		cmd := exec.CommandContext(ctx, "kubectl", args...)
-		cmd.Stdin = bytes.NewReader(input)
-		out, err := cmd.Output()
-		if e, ok := err.(*exec.ExitError); ok {
-			return nil, fmt.Errorf("kubectl: %w: %.512s", e, e.Stderr)
-		}
-		return out, err
-	}}, nil
-}
-func (p *Provider) call(ctx context.Context, input []byte, args ...string) ([]byte, error) {
-	return p.run(ctx, input, append([]string{"--namespace", p.namespace, "--request-timeout=8s"}, args...)...)
+	if strings.TrimSpace(image) == "" {
+		return nil, fmt.Errorf("image must not be empty")
+	}
+	return &Provider{namespace: namespace, image: image, run: kubectl}, nil
 }
 
+func kubectl(ctx context.Context, stdin []byte, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "kubectl", args...)
+	cmd.Stdin = bytes.NewReader(stdin)
+	out, err := cmd.Output()
+	if e, ok := err.(*exec.ExitError); ok {
+		return nil, fmt.Errorf("kubectl: %w: %.512s", e, e.Stderr)
+	}
+	return out, err
+}
+
+func (p *Provider) call(ctx context.Context, stdin []byte, args ...string) ([]byte, error) {
+	return p.run(ctx, stdin, append([]string{"--namespace", p.namespace, "--request-timeout=8s"}, args...)...)
+}
+
+// pod is the subset of the Pod object this provider reads.
 type pod struct {
 	Metadata struct {
 		Name              string
+		Labels            map[string]string
 		CreationTimestamp time.Time
 		DeletionTimestamp *time.Time
 	}
@@ -52,27 +76,79 @@ type pod struct {
 	}
 }
 
+// record maps the observed Pod to the sandbox seen by API callers.
 func (item pod) record() sandbox.Sandbox {
-	state := "pending"
-	for _, c := range item.Status.Conditions {
-		if item.Status.Phase == "Running" && c.Type == "Ready" && c.Status == "True" {
-			state = "ready"
+	template := item.Metadata.Labels[templateLabel]
+	if template == "" {
+		template = sandbox.TemplateLinux
+	}
+	return sandbox.Sandbox{
+		ID:        strings.TrimPrefix(item.Metadata.Name, podPrefix),
+		Template:  template,
+		Status:    item.status(),
+		CreatedAt: item.Metadata.CreationTimestamp,
+	}
+}
+
+func (item pod) status() sandbox.Status {
+	if item.Metadata.DeletionTimestamp != nil {
+		return sandbox.StatusClosing
+	}
+	switch item.Status.Phase {
+	case "Failed", "Succeeded":
+		return sandbox.StatusTerminated
+	case "Running":
+		for _, c := range item.Status.Conditions {
+			if c.Type == "Ready" && c.Status == "True" {
+				return sandbox.StatusReady
+			}
 		}
 	}
-	if item.Status.Phase == "Failed" || item.Status.Phase == "Succeeded" {
-		state = "terminated"
-	}
-	if item.Metadata.DeletionTimestamp != nil {
-		state = "closing"
-	}
-	return sandbox.Sandbox{ID: strings.TrimPrefix(item.Metadata.Name, "ae-"), Template: "linux", Status: state, CreatedAt: item.Metadata.CreationTimestamp}
+	return sandbox.StatusPending
 }
+
+// manifest builds the Pod for a sandbox. The security settings are the
+// isolation baseline: non-root, no capabilities, no privilege escalation,
+// default seccomp profile, no service account token, bounded CPU, memory
+// and lifetime.
+func (p *Provider) manifest(s sandbox.Sandbox) map[string]any {
+	return map[string]any{
+		"apiVersion": "v1",
+		"kind":       "Pod",
+		"metadata": map[string]any{
+			"name":   podPrefix + s.ID,
+			"labels": map[string]string{managedLabel: managedValue, templateLabel: s.Template},
+		},
+		"spec": map[string]any{
+			"restartPolicy":                "Never",
+			"automountServiceAccountToken": false,
+			"activeDeadlineSeconds":        lifetimeSeconds,
+			"securityContext": map[string]any{
+				"runAsNonRoot":   true,
+				"runAsUser":      65534,
+				"seccompProfile": map[string]string{"type": "RuntimeDefault"},
+			},
+			"containers": []any{map[string]any{
+				"name":    "worker",
+				"image":   p.image,
+				"command": []string{"sleep", fmt.Sprint(lifetimeSeconds)},
+				"securityContext": map[string]any{
+					"allowPrivilegeEscalation": false,
+					"capabilities":             map[string]any{"drop": []string{"ALL"}},
+				},
+				"resources": map[string]any{
+					"limits": map[string]string{"cpu": "1", "memory": "128Mi"},
+				},
+			}},
+		},
+	}
+}
+
 func (p *Provider) Create(ctx context.Context, s sandbox.Sandbox) (sandbox.Sandbox, error) {
 	if !validID.MatchString(s.ID) {
 		return sandbox.Sandbox{}, fmt.Errorf("invalid generated id")
 	}
-	spec := map[string]any{"apiVersion": "v1", "kind": "Pod", "metadata": map[string]any{"name": "ae-" + s.ID, "labels": map[string]string{"agent-env.local/managed": "v1"}}, "spec": map[string]any{"restartPolicy": "Never", "automountServiceAccountToken": false, "activeDeadlineSeconds": 3600, "securityContext": map[string]any{"runAsNonRoot": true, "runAsUser": 65534, "seccompProfile": map[string]string{"type": "RuntimeDefault"}}, "containers": []any{map[string]any{"name": "worker", "image": p.image, "command": []string{"sleep", "3600"}, "securityContext": map[string]any{"allowPrivilegeEscalation": false, "capabilities": map[string]any{"drop": []string{"ALL"}}}, "resources": map[string]any{"limits": map[string]string{"cpu": "1", "memory": "128Mi"}}}}}}
-	body, err := json.Marshal(spec)
+	body, err := json.Marshal(p.manifest(s))
 	if err != nil {
 		return sandbox.Sandbox{}, err
 	}
@@ -86,9 +162,13 @@ func (p *Provider) Create(ctx context.Context, s sandbox.Sandbox) (sandbox.Sandb
 	}
 	return created.record(), nil
 }
+
+// selectors restricts a command to the one Pod that both carries the
+// managed label and has the name derived from id.
 func selectors(id string) []string {
-	return []string{"-l", owner, "--field-selector", "metadata.name=ae-" + id}
+	return []string{"-l", owner, "--field-selector", "metadata.name=" + podPrefix + id}
 }
+
 func (p *Provider) Get(ctx context.Context, id string) (sandbox.Sandbox, error) {
 	if !validID.MatchString(id) {
 		return sandbox.Sandbox{}, sandbox.ErrNotFound
@@ -107,9 +187,12 @@ func (p *Provider) Get(ctx context.Context, id string) (sandbox.Sandbox, error) 
 	}
 	return list.Items[0].record(), nil
 }
+
+// Close asks Kubernetes to delete the Pod and returns without waiting.
+// An ID that cannot name a sandbox is treated like one that is already gone.
 func (p *Provider) Close(ctx context.Context, id string) error {
 	if !validID.MatchString(id) {
-		return sandbox.ErrNotFound
+		return nil
 	}
 	args := append([]string{"delete", "pods", "--wait=false", "--ignore-not-found"}, selectors(id)...)
 	_, err := p.call(ctx, nil, args...)
