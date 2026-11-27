@@ -58,11 +58,28 @@
 
 与 Kubernetes Agent Sandbox 的关系：它和本项目目标最接近。本项目先自己写最小实现，弄清并发领取、预热池补充这些问题，到 v5 再评估是否直接采用它的 CRD。
 
-## 4. 还没定的问题
+## 4. v2 的具体选择
+
+- **后端驱动：** kube 暂时沿用 kubectl 管生命周期；docker 用 Go 调用 Linux Docker Engine API，仅 manager 访问本机 socket。容器沿用非 root、禁止提权、CPU/内存限额等基线，绝不挂载 Docker socket。两边都不使用各自的 exec API 实现 SDK 命令；业务协议只有 agent 的一套 HTTP 接口。K8s 与 Docker 是两种供应方式，均可运行普通容器，v6 讨论的是更换隔离机制。
+- **部署配置：** 生命周期由 `-provider=kube|docker` 选择；数据面另设访问模式（建议 `direct|gateway`）。同机 Docker 的回环映射不能发给远程 SDK；选择代理时，gateway 自己必须能访问上游。一个集群共用一个 gateway，无需为每个 Pod 分配公网入口。
+- **镜像内容：** 新增 `cmd/agent` 和模板 Dockerfile，把 agent 作为容器入口，约定工作目录、非 root 用户、监听端口和健康端点。agent 直接打进模板，同一个镜像在两个后端启动；init 容器不作为跨后端前提。
+- **镜像放置：** Git 只存 Dockerfile、agent 源码和模板清单；OCI 镜像推到已有且两边可达的 registry（例如团队 Harbor）。日常发布可打版本 tag，验收模板固定到实际的 `仓库/镜像@sha256:摘要`。架构不同时发布多架构索引，并在 amd64/arm64 各自验证对应镜像。镜像拉取凭据分别配置在 Docker 宿主与 K8s imagePullSecrets，不注入工作负载。
+- **开发捷径：** 可以先本地 build，kind 场景可显式导入；本机镜像缓存不是远端节点的分发机制。无需在 v2 开发 registry、镜像构建服务或运行时热池。
+
+一个模板例子（以下为拟新增字段，摘要由实际发布流程填写）：
+
+```yaml
+name: linux
+image: registry.example.com/agent-env/linux-basic@sha256:<digest>
+agentPort: 8081
+workspace: /workspace
+```
+
+设计参照：[OpenSandbox](https://github.com/opensandbox-group/OpenSandbox) 的共同协议与双后端、[Kubernetes Agent Sandbox](https://agent-sandbox.sigs.k8s.io/docs/python-client/) 的多种连接路径、[E2B runtime](https://github.com/e2b-dev/runtime/blob/main/docs/ARCHITECTURE.md) 的节点路由与 guest agent。它们分别回答后端、连通性和执行边界三个问题。
+
+## 5. 后续版本再决定
 
 | 问题 | 倾向 | 在哪个版本决定 |
 | --- | --- | --- |
-| 执行输出用什么传输 | HTTP 流式响应，文本日志与二进制文件分开；交互式终端以后再加 | v2 |
-| 沙箱内 agent 怎么放进镜像 | 先打进模板镜像；模板变多后改为 init 容器注入 | v2 |
 | 出网限制用什么实现 | 先用 NetworkPolicy 默认拒绝；需要按域名放行时再加出口代理 | v3 |
 | 预热池自己写还是用 CRD | 先写固定水位的最小池，再与 Agent Sandbox 对比 | v5 |
