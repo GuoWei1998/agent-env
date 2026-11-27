@@ -17,4 +17,4 @@ curl -i http://127.0.0.1:8080/v1/sandboxes/ID
 curl -i -X DELETE http://127.0.0.1:8080/v1/sandboxes/ID
 ```
 
-监听地址可用 `-listen` 修改。模拟记录随进程退出清空。阅读[总体设计](docs/design.md)和[技术选型](docs/technology.md)了解模块和实施顺序。
+监听地址可用 `-listen` 修改。模拟记录随进程退出清空。两种真实后端（本机 Docker / Kubernetes）的启动、镜像准备与示例代码见[使用指南](docs/usage.md)；阅读[总体设计](docs/design.md)和[技术选型](docs/technology.md)了解模块和实施顺序。
