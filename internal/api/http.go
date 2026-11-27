@@ -1,7 +1,9 @@
 package api
 
 import (
+	"agent-env/internal/route"
 	"agent-env/internal/sandbox"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"io"
@@ -12,7 +14,29 @@ import (
 // New returns the manager HTTP API. Handlers only translate between HTTP and
 // sandbox.Service; they never reach into a provider directly.
 func New(service sandbox.Service) http.Handler {
+	return WithRoutes(service, nil)
+}
+func WithRoutes(service sandbox.Service, key ed25519.PrivateKey) http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sandboxes/{id}/route", func(w http.ResponseWriter, r *http.Request) {
+		resolver, ok := service.Provider.(route.Resolver)
+		if !ok || len(key) != ed25519.PrivateKeySize {
+			fail(w, 501, "execution_unavailable")
+			return
+		}
+		id := r.PathValue("id")
+		target, e := resolver.ResolveEndpoint(r.Context(), id)
+		if errors.Is(e, route.ErrPending) {
+			fail(w, 409, "not_ready")
+			return
+		}
+		if e != nil {
+			failure(w, e)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		reply(w, 200, route.Issue(key, id, target))
+	})
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		reply(w, 200, map[string]string{"status": "ok"})
 	})

@@ -35,6 +35,7 @@ type runner func(ctx context.Context, stdin []byte, args ...string) ([]byte, err
 
 type Provider struct {
 	namespace, image string
+	publicKey        string
 	run              runner
 }
 
@@ -66,12 +67,14 @@ func (p *Provider) call(ctx context.Context, stdin []byte, args ...string) ([]by
 type pod struct {
 	Metadata struct {
 		Name              string
+		UID               string
 		Labels            map[string]string
 		CreationTimestamp time.Time
 		DeletionTimestamp *time.Time
 	}
 	Status struct {
 		Phase      string
+		PodIP      string
 		Conditions []struct{ Type, Status string }
 	}
 }
@@ -112,7 +115,7 @@ func (item pod) status() sandbox.Status {
 // default seccomp profile, no service account token, bounded CPU, memory
 // and lifetime.
 func (p *Provider) manifest(s sandbox.Sandbox) map[string]any {
-	return map[string]any{
+	m := map[string]any{
 		"apiVersion": "v1",
 		"kind":       "Pod",
 		"metadata": map[string]any{
@@ -142,6 +145,13 @@ func (p *Provider) manifest(s sandbox.Sandbox) map[string]any {
 			}},
 		},
 	}
+	if p.publicKey != "" {
+		worker := m["spec"].(map[string]any)["containers"].([]any)[0].(map[string]any)
+		delete(worker, "command")
+		worker["env"] = []any{map[string]any{"name": "AE_SANDBOX", "value": s.ID}, map[string]any{"name": "AE_PUBLIC_KEY", "value": p.publicKey}, map[string]any{"name": "AE_INSTANCE", "valueFrom": map[string]any{"fieldRef": map[string]any{"fieldPath": "metadata.uid"}}}}
+		worker["readinessProbe"] = map[string]any{"httpGet": map[string]any{"path": "/readyz", "port": 8081}, "periodSeconds": 1}
+	}
+	return m
 }
 
 func (p *Provider) Create(ctx context.Context, s sandbox.Sandbox) (sandbox.Sandbox, error) {
@@ -170,22 +180,26 @@ func selectors(id string) []string {
 }
 
 func (p *Provider) Get(ctx context.Context, id string) (sandbox.Sandbox, error) {
+	item, err := p.find(ctx, id)
+	return item.record(), err
+}
+func (p *Provider) find(ctx context.Context, id string) (pod, error) {
 	if !validID.MatchString(id) {
-		return sandbox.Sandbox{}, sandbox.ErrNotFound
+		return pod{}, sandbox.ErrNotFound
 	}
 	args := append([]string{"get", "pods", "-o", "json"}, selectors(id)...)
 	out, err := p.call(ctx, nil, args...)
 	if err != nil {
-		return sandbox.Sandbox{}, err
+		return pod{}, err
 	}
 	var list struct{ Items []pod }
 	if err = json.Unmarshal(out, &list); err != nil {
-		return sandbox.Sandbox{}, err
+		return pod{}, err
 	}
 	if len(list.Items) == 0 {
-		return sandbox.Sandbox{}, sandbox.ErrNotFound
+		return pod{}, sandbox.ErrNotFound
 	}
-	return list.Items[0].record(), nil
+	return list.Items[0], nil
 }
 
 // Close asks Kubernetes to delete the Pod and returns without waiting.

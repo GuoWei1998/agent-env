@@ -3,15 +3,19 @@ package main
 
 import (
 	"agent-env/internal/api"
+	"agent-env/internal/provider/docker"
 	"agent-env/internal/provider/kube"
 	"agent-env/internal/provider/memory"
 	"agent-env/internal/sandbox"
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -19,18 +23,31 @@ import (
 
 func main() {
 	addr := flag.String("listen", "127.0.0.1:8080", "manager listen address")
-	backend := flag.String("provider", "memory", "memory or kube")
+	backend := flag.String("provider", "memory", "memory, kube or docker")
+	socket := flag.String("docker-socket", "/var/run/docker.sock", "local Engine socket")
 	namespace := flag.String("namespace", "agent-env", "dedicated Kubernetes namespace")
-	image := flag.String("image", "busybox:1.36.1", "Linux worker image with sleep on PATH")
+	image := flag.String("image", "agent-env-worker:v2", "OCI worker image containing agent")
 	flag.Parse()
 
-	provider, err := newProvider(*backend, *namespace, *image)
+	pub, key, err := ed25519.GenerateKey(nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if seed := os.Getenv("AE_SIGNING_SEED"); seed != "" {
+		b, e := base64.RawURLEncoding.DecodeString(seed)
+		if e != nil || len(b) != ed25519.SeedSize {
+			log.Fatal("invalid AE_SIGNING_SEED")
+		}
+		key = ed25519.NewKeyFromSeed(b)
+		pub = key.Public().(ed25519.PublicKey)
+	}
+	provider, err := newProvider(*backend, *namespace, *image, *socket, base64.RawURLEncoding.EncodeToString(pub))
 	if err != nil {
 		log.Fatal(err)
 	}
 	server := http.Server{
 		Addr:              *addr,
-		Handler:           api.New(sandbox.Service{Provider: provider}),
+		Handler:           api.WithRoutes(sandbox.Service{Provider: provider}, key),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      10 * time.Second,
@@ -52,13 +69,19 @@ func main() {
 	}
 }
 
-func newProvider(backend, namespace, image string) (sandbox.Provider, error) {
+func newProvider(backend, namespace, image, socket, key string) (sandbox.Provider, error) {
 	switch backend {
 	case "memory":
 		return memory.New(), nil
 	case "kube":
-		return kube.New(namespace, image)
+		p, e := kube.New(namespace, image)
+		if e == nil {
+			p.EnableAgent(key)
+		}
+		return p, e
+	case "docker":
+		return docker.New(socket, image, key), nil
 	default:
-		return nil, fmt.Errorf("unknown provider %q: use memory or kube", backend)
+		return nil, fmt.Errorf("unknown provider %q", backend)
 	}
 }

@@ -1,6 +1,6 @@
 # agent-env
 
-个人 Go 执行环境项目。默认使用内存模拟后端；v1 支持单集群真实 Pod 冷创建、就绪查询和关闭，见[迭代计划与真集群验收](docs/iteration-plan.md)。Go 客户端位于 `pkg/client`，提供 Create、Get、WaitReady、Close。构建需要 Go 1.22 或更高版本，真实运行另需 kubectl 与测试集群。
+个人 Go 执行环境项目。memory 用于管理接口模拟；kube 与本机 Linux Docker 使用同一个工作镜像，通过 Go SDK 执行命令和读写文件。需要 Go 1.25+（workspace 文件操作使用 os.Root）。见[v2 构建与双后端验收](docs/v2-run.md)。
 
 ```sh
 go test ./...
