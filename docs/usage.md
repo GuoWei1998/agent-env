@@ -48,6 +48,14 @@ docker tag agent-env-worker:v2 swr.cn-southwest-2.myhuaweicloud.com/<组织>/age
 docker push swr.cn-southwest-2.myhuaweicloud.com/<组织>/agent-env-worker:v2
 ```
 
+任务需要额外运行时（例如评测评分要跑 `python3`）时，用 `Dockerfile.python` 变体在基础镜像上加包：
+
+```sh
+docker build -f Dockerfile.python -t agent-env-worker-python:v2 .
+docker tag agent-env-worker-python:v2 swr.cn-southwest-2.myhuaweicloud.com/<组织>/agent-env-worker-python:v2
+docker push swr.cn-southwest-2.myhuaweicloud.com/<组织>/agent-env-worker-python:v2
+```
+
 私有仓库需要在命名空间配置拉取凭据（kube 后端的 Pod 清单不带 imagePullSecrets，凭据挂在 ServiceAccount 上）：
 
 ```sh

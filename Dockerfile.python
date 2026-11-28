@@ -1,0 +1,9 @@
+# Worker variant with python3 for tasks and graders that need it (for
+# example the OmniAssistant v0.3 evaluation suite). Build the base image
+# first: docker build -t agent-env-worker:v2 . && docker build -f Dockerfile.python -t agent-env-worker-python:v2 .
+FROM agent-env-worker:v2
+USER root
+RUN apk add --no-cache python3 \
+ && chmod 0755 /usr/bin/python3 /usr/bin/python3.12 \
+ && chmod -R a+rX /usr/lib/python3.12 /usr/lib/libpython3.12.so.1.0
+USER 65534:65534
